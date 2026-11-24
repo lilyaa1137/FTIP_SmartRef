@@ -1,0 +1,24 @@
+[
+  {
+    "ticketId": "REF-FTIP-20261125-F8CF",
+    "createdAt": "2026-11-24T17:32:54.979Z",
+    "name": "Lily",
+    "npmOrNip": "210810250111",
+    "email": "alya25034@mail.unpad.ac.id",
+    "programLabel": "S1 - Teknologi Pangan",
+    "category": "Penelusuran Literatur & Jurnal",
+    "question": "kulit pisangggg",
+    "status": "Tercatat di Antrean Lokal"
+  },
+  {
+    "ticketId": "REF-FTIP-20261124-63AD",
+    "createdAt": "2026-11-24T15:38:49.300Z",
+    "name": "Alya Rahmawati",
+    "npmOrNip": "240110220001",
+    "email": "lily@example.com",
+    "programLabel": "S1 - Teknologi Pangan",
+    "category": "Penelusuran Literatur & Jurnal",
+    "question": "Mohon bantuan akses referensi standar keamanan pangan HACCP untuk tugas akhir.",
+    "status": "Tercatat di Antrean Lokal"
+  }
+]

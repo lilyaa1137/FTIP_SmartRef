@@ -1,0 +1,6 @@
+{
+  "name": "FTIP SmartRef",
+  "description": "Asisten Referensi Cerdas untuk Sivitas Akademika Fakultas Teknologi Industri Pertanian, Universitas Padjadjaran. Temukan Referensi, Kembangkan Inovasi.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
