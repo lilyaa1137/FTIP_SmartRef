@@ -140,7 +140,7 @@ async function writeInquiry(record: LibrarianInquiryRecord): Promise<void> {
   await fs.writeFile(INQUIRIES_FILE, JSON.stringify(updated, null, 2), 'utf-8');
 }
 
-async function startServer() {
+export async function createApp() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
@@ -599,3 +599,5 @@ startServer().catch((err) => {
   console.error('Gagal menjalankan server FTIP SmartRef:', err);
   process.exit(1);
 });
+return app;
+}
