@@ -6,29 +6,23 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
+import type { Content, FunctionDeclaration, Part } from '@google/genai';
 import {
-  generateLocalAssistantReply,
-  generateLocalKeywords,
-} from './src/utils/localSmartRef.ts';
+  GEMINI_MODEL,
+  buildChatSystemInstruction,
+  buildKeywordPrompt,
+  classifyGeminiError,
+  isRetryableGeminiError,
+  sanitizeText,
+  searchAcademicWorks,
+} from './src/utils/academicCore.ts';
+import type { IncomingMessage, ProgramContext } from './src/utils/academicCore.ts';
+import type { JournalArticle } from './src/types/smartref.ts';
 
 const PORT = Number(process.env.PORT) || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const INQUIRIES_FILE = path.resolve(DATA_DIR, 'librarian_inquiries.json');
-
-interface ProgramContext {
-  id?: string;
-  level?: string;
-  name?: string;
-  thesisTerm?: string;
-  focusAreas?: string[];
-  sampleJournalQuery?: string;
-}
-
-interface IncomingMessage {
-  role: 'user' | 'model';
-  text: string;
-}
 
 interface LibrarianInquiryRecord {
   ticketId: string;
@@ -57,71 +51,43 @@ function getGeminiClient(): GoogleGenAI | null {
   });
 }
 
-function sanitizeText(value: unknown, maxLength: number): string {
-  if (typeof value !== 'string') return '';
-  return value.trim().slice(0, maxLength);
-}
-
-function sanitizeSafeHttpUrl(urlValue: unknown): string | null {
-  if (typeof urlValue !== 'string' || !urlValue.trim()) return null;
-  try {
-    const parsed = new URL(urlValue.trim());
-    if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
-      return parsed.toString();
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function reconstructAbstract(invertedIndex: unknown, maxWords = 48): string | null {
-  if (!invertedIndex || typeof invertedIndex !== 'object' || Array.isArray(invertedIndex)) {
-    return null;
-  }
-  const positions: Array<[number, string]> = [];
-  for (const [word, indices] of Object.entries(invertedIndex as Record<string, unknown>)) {
-    if (!Array.isArray(indices)) continue;
-    for (const pos of indices) {
-      if (typeof pos === 'number' && Number.isFinite(pos) && pos >= 0 && pos < 500) {
-        positions.push([pos, word]);
+async function callGeminiWithRetry<T>(fn: () => Promise<T>, maxAttempts = 2): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxAttempts && isRetryableGeminiError(err)) {
+        await new Promise((resolve) => setTimeout(resolve, 600 * attempt));
+        continue;
       }
+      throw err;
     }
   }
-  if (positions.length === 0) return null;
-  positions.sort((a, b) => a[0] - b[0]);
-  const words = positions.slice(0, maxWords).map(([, w]) => w);
-  const text = words.join(' ').replace(/\s+/g, ' ').trim();
-  return positions.length > maxWords ? `${text}...` : text;
+  throw lastError;
 }
 
-function buildPersonalizationBlock(program?: ProgramContext): string {
-  if (!program || !program.name) {
-    return 'Pengguna belum memilih program studi spesifik. Berikan panduan referensi umum untuk bidang Teknik Pertanian, Teknologi Pangan, atau Teknologi Industri Pertanian di FTIP Unpad.';
-  }
-  const level = sanitizeText(program.level, 10) || 'S1';
-  const name = sanitizeText(program.name, 100);
-  const thesisTerm = sanitizeText(program.thesisTerm, 60) || 'Tugas Akhir';
-  const focus = Array.isArray(program.focusAreas)
-    ? program.focusAreas.map((f) => sanitizeText(f, 80)).filter(Boolean).join(', ')
-    : '';
-
-  let depthGuidance =
-    'Berikan penjelasan terstruktur, definisi konsep inti, panduan metodologi praktis, serta rekomendasi istilah pencarian.';
-  if (level === 'S2') {
-    depthGuidance =
-      'Sesuaikan kedalaman untuk mahasiswa Magister (S2): tekankan pemetaan research gap, kerangka teoretis/pemodelan, perbandingan metodologi lintas studi, dan strategi tinjauan pustaka sistematis.';
-  } else if (level === 'S3') {
-    depthGuidance =
-      'Sesuaikan kedalaman untuk kandidat Doktor (S3): tekankan identifikasi state-of-the-art, kebaruan ilmiah (novelty), sintesis literatur mutakhir berstandar PRISMA, serta kontribusi fundamental atau lintas disiplin.';
-  }
-
-  return `Profil Akademik Pengguna:
-- Jenjang: ${level} (${thesisTerm})
-- Program Studi: ${name} (Fakultas Teknologi Industri Pertanian, Universitas Padjadjaran)
-- Bidang Fokus Utama: ${focus || 'Agroindustri dan Teknologi Pertanian'}
-- Panduan Kedalaman: ${depthGuidance}`;
-}
+const searchAcademicLiteratureDeclaration: FunctionDeclaration = {
+  name: 'searchAcademicLiterature',
+  description:
+    'Cari publikasi ilmiah nyata dan terverifikasi dari basis data OpenAlex dan Crossref menggunakan kueri Bahasa Inggris akademik yang ringkas dan akurat. Gunakan alat ini setiap kali pengguna meminta referensi/jurnal/literatur, atau saat pengguna mengeksplorasi suatu topik riset dan contoh artikel terverifikasi akan memperkaya jawaban.',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      englishQuery: {
+        type: Type.STRING,
+        description:
+          'Kueri pencarian akademik Bahasa Inggris yang ringkas dan spesifik (3-7 kata, tanpa operator NOT panjang), mis. "machine learning crop quality prediction", "coffee drying temperature sensory quality", atau "edible coating fruit shelf life".',
+      },
+      yearFrom: {
+        type: Type.INTEGER,
+        description: 'Tahun terbit minimum (opsional, misalnya 2019 atau 2020 untuk literatur mutakhir).',
+      },
+    },
+    required: ['englishQuery'],
+  },
+};
 
 async function readInquiries(): Promise<LibrarianInquiryRecord[]> {
   try {
@@ -140,15 +106,16 @@ async function writeInquiry(record: LibrarianInquiryRecord): Promise<void> {
   await fs.writeFile(INQUIRIES_FILE, JSON.stringify(updated, null, 2), 'utf-8');
 }
 
-export async function createApp() {
+async function startServer() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
-  // 1. AI Reference Assistant Chat Endpoint (Gemini AI + transparent local guidance fallback)
+  // 1. Gemini AI Reference Assistant Chat Endpoint (with Dynamic OpenAlex + Crossref Tool Calling)
   app.post('/api/chat', async (req: Request, res: Response) => {
     try {
       const rawMessages = Array.isArray(req.body?.messages) ? req.body.messages : [];
       const program: ProgramContext | undefined = req.body?.program;
+      const hasExplicitProgram = req.body?.hasExplicitProgram === true;
 
       const cleanMessages: IncomingMessage[] = rawMessages
         .slice(-16)
@@ -165,88 +132,162 @@ export async function createApp() {
         return;
       }
 
-      const latestMessage = cleanMessages[cleanMessages.length - 1].text;
       const ai = getGeminiClient();
+      if (!ai) {
+        res.status(503).json({
+          errorCode: 'MISSING_GEMINI_API_KEY',
+          error:
+            'Asisten AI Gemini belum aktif karena GEMINI_API_KEY belum dikonfigurasi pada server. Periksa atau tambahkan API key di panel Settings > Secrets. Anda tetap dapat menelusuri artikel ilmiah nyata melalui tab Journal Finder.',
+        });
+        return;
+      }
 
-      if (ai) {
-        try {
-          const systemInstruction = `Anda adalah FTIP SmartRef, asisten referensi perpustakaan digital resmi untuk Fakultas Teknologi Industri Pertanian (FTIP), Universitas Padjadjaran (Unpad).
+      const systemInstruction = buildChatSystemInstruction(
+        program,
+        hasExplicitProgram,
+        cleanMessages
+      );
 
-${buildPersonalizationBlock(program)}
+      const contents: Content[] = cleanMessages.map((m) => ({
+        role: m.role,
+        parts: [{ text: m.text }],
+      }));
 
-Aturan Utama:
-1. Selalu gunakan Bahasa Indonesia yang akademik, santun, jelas, dan mudah dipahami mahasiswa maupun dosen.
-2. Sesuaikan saran sumber, kedalaman metodologi, dan sudut pandang riset dengan jenjang (S1/S2/S3) serta program studi pengguna.
-3. Bantu mahasiswa merumuskan topik penelitian, menyarankan kata kunci/strategi pencarian, serta merekomendasikan basis data ilmiah yang relevan (OpenAlex, ScienceDirect, Scopus, SpringerLink, Portal Garuda, SINTA, Kandaga Unpad).
-4. JANGAN PERNAH mengarang atau memalsukan judul artikel jurnal spesifik, nama penulis, tahun terbit, volume, atau DOI dari ingatan. Jelaskan secara jujur bila Anda tidak dapat memverifikasi artikel tertentu secara langsung dan arahkan pengguna untuk memverifikasinya di fitur Journal Finder (OpenAlex).
-5. Format jawaban dengan poin-poin rapi agar mudah dibaca.`;
+      const tools = [{ functionDeclarations: [searchAcademicLiteratureDeclaration] }];
+      const verifiedArticlesMap = new Map<string, JournalArticle>();
+      let lastSuggestedQuery: string | undefined;
+      let finalReply = '';
 
-          const contents = cleanMessages.map((m) => ({
-            role: m.role,
-            parts: [{ text: m.text }],
-          }));
-
-          const response = await ai.models.generateContent({
-            model: 'gemini-4-hydrogen',
+      for (let round = 0; round < 3; round++) {
+        const response = await callGeminiWithRetry(() =>
+          ai.models.generateContent({
+            model: GEMINI_MODEL,
             contents,
             config: {
               systemInstruction,
+              tools,
             },
-          });
+          })
+        );
 
-          const reply = response.text?.trim();
-          if (reply) {
-            const localMeta = generateLocalAssistantReply(latestMessage, {
-              level: (program?.level as 'S1' | 'S2' | 'S3') || 'S1',
-              name: program?.name,
-              thesisTerm: program?.thesisTerm,
-              focusAreas: program?.focusAreas,
-              sampleJournalQuery: program?.sampleJournalQuery,
-            });
-            res.json({
-              reply,
-              sourceMode: 'gemini',
-              suggestedSearchQuery: localMeta.suggestedSearchQuery,
-            });
-            return;
-          }
-        } catch (geminiErr) {
-          console.error('[FTIP SmartRef /api/chat] Gemini upstream error, falling back:', geminiErr);
+        const candidateContent = response.candidates?.[0]?.content;
+        const parts: Part[] = Array.isArray(candidateContent?.parts) ? candidateContent.parts : [];
+        const functionCalls = parts.filter((p) => Boolean(p.functionCall));
+
+        if (functionCalls.length === 0 || !candidateContent) {
+          finalReply = (response.text ?? '').trim();
+          break;
         }
-      } else {
-        console.warn('[FTIP SmartRef /api/chat] GEMINI_API_KEY tidak tersedia, menggunakan mode panduan referensi lokal.');
+
+        contents.push(candidateContent);
+
+        const functionResponseParts: Part[] = [];
+        for (const part of functionCalls) {
+          const fc = part.functionCall!;
+          if (fc.name === 'searchAcademicLiterature') {
+            const args = (fc.args || {}) as Record<string, unknown>;
+            const englishQuery = sanitizeText(args.englishQuery, 200);
+            const yearFromRaw = Number(args.yearFrom);
+            const yearFrom =
+              Number.isInteger(yearFromRaw) && yearFromRaw >= 1980 && yearFromRaw <= 2030
+                ? yearFromRaw
+                : 2018;
+
+            if (englishQuery) {
+              lastSuggestedQuery = englishQuery;
+            }
+
+            let searchResult: { totalCount: number; articles: JournalArticle[] } = {
+              totalCount: 0,
+              articles: [],
+            };
+            let searchError: string | null = null;
+
+            try {
+              searchResult = await searchAcademicWorks(englishQuery || 'agricultural technology', {
+                perPage: 4,
+                yearFrom,
+                sort: 'relevance',
+                timeoutMs: 4500,
+              });
+              for (const art of searchResult.articles) {
+                const key = art.doiUrl || art.id;
+                if (!verifiedArticlesMap.has(key)) {
+                  verifiedArticlesMap.set(key, art);
+                }
+              }
+            } catch (err) {
+              searchError =
+                err instanceof Error ? err.message : 'Gagal mengakses OpenAlex/Crossref.';
+            }
+
+            functionResponseParts.push({
+              functionResponse: {
+                id: fc.id,
+                name: fc.name,
+                response: {
+                  queryUsed: englishQuery,
+                  totalFound: searchResult.totalCount,
+                  error: searchError,
+                  articles: searchResult.articles.map((a) => ({
+                    title: a.title,
+                    authors: a.authors.slice(0, 3),
+                    year: a.publicationYear,
+                    journal: a.sourceName,
+                    doiUrl: a.doiUrl,
+                    landingUrl: a.landingUrl,
+                    citedByCount: a.citedByCount,
+                    provider: a.sourceProvider,
+                  })),
+                },
+              },
+            });
+          }
+        }
+
+        if (functionResponseParts.length === 0) {
+          finalReply = (response.text ?? '').trim();
+          break;
+        }
+
+        contents.push({
+          role: 'user',
+          parts: functionResponseParts,
+        });
       }
 
-      // Transparent Local Reference Guidance Fallback
-      const localFallback = generateLocalAssistantReply(latestMessage, {
-        level: (program?.level as 'S1' | 'S2' | 'S3') || 'S1',
-        name: program?.name,
-        thesisTerm: program?.thesisTerm,
-        focusAreas: program?.focusAreas,
-        sampleJournalQuery: program?.sampleJournalQuery,
-      });
+      if (!finalReply) {
+        res.status(502).json({
+          errorCode: 'GEMINI_EMPTY_RESPONSE',
+          error:
+            'Gemini AI tidak mengembalikan teks jawaban yang valid. Silakan kirim ulang pertanyaan Anda.',
+        });
+        return;
+      }
 
       res.json({
-        reply: localFallback.reply,
-        sourceMode: 'local',
-        suggestedSearchQuery: localFallback.suggestedSearchQuery,
-        modeNotice:
-          'Mode Panduan Referensi Lokal aktif karena kunci GEMINI_API_KEY server belum terpasang atau sedang tidak terjangkau.',
+        reply: finalReply,
+        sourceMode: 'gemini',
+        suggestedSearchQuery: lastSuggestedQuery,
+        verifiedArticles: Array.from(verifiedArticlesMap.values()).slice(0, 5),
       });
     } catch (error) {
       console.error('[FTIP SmartRef /api/chat]', error);
-      res.status(500).json({
-        error: 'Terjadi kendala saat memproses pertanyaan Anda. Silakan coba beberapa saat lagi.',
+      const classified = classifyGeminiError(error);
+      res.status(classified.httpStatus).json({
+        errorCode: classified.errorCode,
+        error: classified.message,
       });
     }
   });
 
-  // 2. Smart Keyword Generator Endpoint (Gemini AI + Local Academic Keyword Fallback)
+  // 2. Smart Keyword Generator Endpoint (Gemini AI)
   app.post('/api/keywords', async (req: Request, res: Response) => {
     try {
       const topic = sanitizeText(req.body?.topic, 600);
       const focus = sanitizeText(req.body?.focus, 300);
       const program: ProgramContext | undefined = req.body?.program;
+      const hasExplicitProgram = req.body?.hasExplicitProgram === true;
 
       if (topic.length < 5) {
         res.status(400).json({
@@ -256,118 +297,100 @@ Aturan Utama:
       }
 
       const ai = getGeminiClient();
-
-      if (ai) {
-        try {
-          const prompt = `Analisis topik riset berikut untuk sivitas akademika FTIP Universitas Padjadjaran dan susun strategi kata kunci penelusuran literatur ilmiah.
-
-${buildPersonalizationBlock(program)}
-
-Topik Riset: "${topic}"
-${focus ? `Fokus / Metode Tambahan: "${focus}"` : ''}
-
-Instruksi:
-- Hasilkan kata kunci utama dalam Bahasa Indonesia dan Bahasa Inggris yang tepat secara terminologi agroindustri, teknologi pangan, atau teknik pertanian.
-- Berikan daftar istilah terkait dan sinonim teknis yang sering dipakai di jurnal internasional.
-- Susun 3 variasi strategi pencarian Boolean siap pakai menggunakan operator AND, OR, dan NOT (pastikan setidaknya satu kueri mencontohkan operator NOT untuk menyaring konteks di luar topik) serta tanda kutip frasa.
-- Berikan daftar kueri pencarian yang disarankan untuk database ilmiah (OpenAlex, ScienceDirect, Scopus, Portal Garuda) dan catatan strategi singkat dalam Bahasa Indonesia sesuai jenjang studi pengguna.`;
-
-          const response = await ai.models.generateContent({
-            model: 'gemini-4-hydrogen',
-            contents: prompt,
-            config: {
-              systemInstruction:
-                'Anda adalah pustakawan spesialis literasi informasi ilmiah untuk bidang Teknologi Pertanian, Teknologi Pangan, dan Teknologi Industri Pertanian.',
-              responseMimeType: 'application/json',
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                  kataKunciIndonesia: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
-                  },
-                  kataKunciInggris: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
-                  },
-                  sinonimTeknis: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        istilah: { type: Type.STRING },
-                        padanan: {
-                          type: Type.ARRAY,
-                          items: { type: Type.STRING },
-                        },
-                      },
-                      required: ['istilah', 'padanan'],
-                    },
-                  },
-                  strategiBoolean: {
-                    type: Type.ARRAY,
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        label: { type: Type.STRING },
-                        query: { type: Type.STRING },
-                        targetDatabase: { type: Type.STRING },
-                      },
-                      required: ['label', 'query', 'targetDatabase'],
-                    },
-                  },
-                  istilahPencarianDisarankan: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
-                  },
-                  catatanStrategi: {
-                    type: Type.STRING,
-                  },
-                },
-                required: [
-                  'kataKunciIndonesia',
-                  'kataKunciInggris',
-                  'sinonimTeknis',
-                  'strategiBoolean',
-                  'istilahPencarianDisarankan',
-                  'catatanStrategi',
-                ],
-              },
-            },
-          });
-
-          const rawJson = (response.text ?? '{}').trim();
-          const parsed = JSON.parse(rawJson);
-          res.json({
-            ...parsed,
-            sourceMode: 'gemini',
-          });
-          return;
-        } catch (geminiErr) {
-          console.error('[FTIP SmartRef /api/keywords] Gemini upstream error, using local fallback:', geminiErr);
-        }
-      } else {
-        console.warn('[FTIP SmartRef /api/keywords] GEMINI_API_KEY tidak tersedia, menggunakan generator kata kunci lokal.');
+      if (!ai) {
+        res.status(503).json({
+          errorCode: 'MISSING_GEMINI_API_KEY',
+          error:
+            'Smart Keyword Generator AI belum aktif karena GEMINI_API_KEY belum dikonfigurasi pada server. Silakan periksa panel Settings > Secrets.',
+        });
+        return;
       }
 
-      // Local Keyword Generator Fallback
-      const localResult = generateLocalKeywords(topic, focus, {
-        level: (program?.level as 'S1' | 'S2' | 'S3') || 'S1',
-        name: program?.name,
-        thesisTerm: program?.thesisTerm,
-        focusAreas: program?.focusAreas,
-      });
+      const prompt = buildKeywordPrompt(topic, focus, program, hasExplicitProgram);
 
-      res.json(localResult);
+      const response = await callGeminiWithRetry(() =>
+        ai.models.generateContent({
+          model: GEMINI_MODEL,
+          contents: prompt,
+          config: {
+            systemInstruction:
+              'Anda adalah pustakawan spesialis literasi informasi ilmiah untuk bidang Teknologi Pangan, Teknik Pertanian, Teknologi Industri Pertanian, Sosial Ekonomi Pertanian, dan ilmu pertanian interdisipliner.',
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                kataKunciIndonesia: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                },
+                kataKunciInggris: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                },
+                sinonimTeknis: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      istilah: { type: Type.STRING },
+                      padanan: {
+                        type: Type.ARRAY,
+                        items: { type: Type.STRING },
+                      },
+                    },
+                    required: ['istilah', 'padanan'],
+                  },
+                },
+                strategiBoolean: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      label: { type: Type.STRING },
+                      query: { type: Type.STRING },
+                      targetDatabase: { type: Type.STRING },
+                    },
+                    required: ['label', 'query', 'targetDatabase'],
+                  },
+                },
+                istilahPencarianDisarankan: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                },
+                catatanStrategi: {
+                  type: Type.STRING,
+                },
+              },
+              required: [
+                'kataKunciIndonesia',
+                'kataKunciInggris',
+                'sinonimTeknis',
+                'strategiBoolean',
+                'istilahPencarianDisarankan',
+                'catatanStrategi',
+              ],
+            },
+          },
+        })
+      );
+
+      const rawJson = (response.text ?? '{}').trim();
+      const parsed = JSON.parse(rawJson);
+      res.json({
+        ...parsed,
+        sourceMode: 'gemini',
+      });
     } catch (error) {
       console.error('[FTIP SmartRef /api/keywords]', error);
-      res.status(500).json({
-        error: 'Terjadi kendala saat memproses kata kunci. Silakan coba kembali.',
+      const classified = classifyGeminiError(error);
+      res.status(classified.httpStatus).json({
+        errorCode: classified.errorCode,
+        error: classified.message,
       });
     }
   });
 
-  // 3. OpenAlex Real Scholarly Journal Finder Endpoint
+  // 3. Real Scholarly Journal Finder Endpoint (OpenAlex primary + Crossref fallback)
   app.get('/api/journals', async (req: Request, res: Response) => {
     try {
       const q = sanitizeText(req.query.q, 240);
@@ -382,113 +405,30 @@ Instruksi:
           ? yearFromRaw
           : null;
       const openAccessOnly = req.query.openAccess === 'true';
-      const sortParam =
+      const sortParam: 'relevance' | 'year' | 'cited' =
         req.query.sort === 'year'
-          ? 'publication_year:desc'
+          ? 'year'
           : req.query.sort === 'cited'
-            ? 'cited_by_count:desc'
-            : 'relevance_score:desc';
+            ? 'cited'
+            : 'relevance';
 
-      const filters: string[] = [];
-      if (yearFrom) {
-        filters.push(`from_publication_date:${yearFrom}-01-01`);
-      }
-      if (openAccessOnly) {
-        filters.push('is_oa:true');
-      }
-
-      const params = new URLSearchParams({
-        search: q,
-        'per-page': '12',
+      const result = await searchAcademicWorks(q, {
+        perPage: 12,
+        yearFrom,
+        openAccessOnly,
         sort: sortParam,
-        select:
-          'id,title,publication_year,authorships,primary_location,open_access,cited_by_count,doi,abstract_inverted_index,type',
-      });
-
-      if (filters.length > 0) {
-        params.set('filter', filters.join(','));
-      }
-
-      const openAlexUrl = `https://api.openalex.org/works?${params.toString()}`;
-      const upstreamRes = await fetch(openAlexUrl, {
-        headers: {
-          Accept: 'application/json',
-          'User-Agent': 'FTIP-SmartRef-Unpad/1.0 (mailto:library.ftip@unpad.ac.id)',
-        },
-      });
-
-      const upstreamContentType = (upstreamRes.headers.get('content-type') || '').toLowerCase();
-      if (!upstreamRes.ok || !upstreamContentType.includes('application/json')) {
-        const bodyPreview = await upstreamRes.text().catch(() => '');
-        console.error(
-          `[FTIP SmartRef /api/journals] Upstream OpenAlex error ${upstreamRes.status} (${upstreamContentType}):`,
-          bodyPreview.slice(0, 200)
-        );
-        res.status(502).json({
-          error:
-            'Layanan pencarian OpenAlex sedang mengalami gangguan sementara. Silakan coba kembali beberapa saat lagi.',
-        });
-        return;
-      }
-
-      const data = (await upstreamRes.json()) as {
-        meta?: { count?: number };
-        results?: Array<Record<string, unknown>>;
-      };
-
-      const articles = (Array.isArray(data.results) ? data.results : []).map((work) => {
-        const authorships = Array.isArray(work.authorships) ? work.authorships : [];
-        const authors = authorships
-          .slice(0, 5)
-          .map((a) => {
-            const authorObj = (a as Record<string, unknown>)?.author as
-              | Record<string, unknown>
-              | undefined;
-            return typeof authorObj?.display_name === 'string' ? authorObj.display_name : '';
-          })
-          .filter(Boolean);
-
-        const primaryLocation = work.primary_location as Record<string, unknown> | undefined;
-        const source = primaryLocation?.source as Record<string, unknown> | undefined;
-        const openAccess = work.open_access as Record<string, unknown> | undefined;
-
-        const doiUrl = sanitizeSafeHttpUrl(work.doi);
-        const landingUrl =
-          sanitizeSafeHttpUrl(openAccess?.oa_url) ||
-          sanitizeSafeHttpUrl(primaryLocation?.landing_page_url) ||
-          doiUrl ||
-          sanitizeSafeHttpUrl(work.id);
-
-        return {
-          id: typeof work.id === 'string' ? work.id : crypto.randomUUID(),
-          title:
-            typeof work.title === 'string' && work.title.trim()
-              ? work.title.trim()
-              : 'Judul tidak tersedia',
-          authors: authors.length > 0 ? authors : ['Penulis tidak tercantum'],
-          publicationYear: typeof work.publication_year === 'number' ? work.publication_year : null,
-          sourceName:
-            typeof source?.display_name === 'string' && source.display_name.trim()
-              ? source.display_name.trim()
-              : 'Sumber jurnal / repositori ilmiah',
-          isOpenAccess: Boolean(openAccess?.is_oa),
-          citedByCount: typeof work.cited_by_count === 'number' ? work.cited_by_count : 0,
-          doiUrl,
-          landingUrl,
-          abstractSnippet: reconstructAbstract(work.abstract_inverted_index),
-          type: typeof work.type === 'string' ? work.type : 'article',
-        };
+        timeoutMs: 7000,
       });
 
       res.json({
-        totalCount: typeof data.meta?.count === 'number' ? data.meta.count : articles.length,
-        articles,
+        totalCount: result.totalCount,
+        articles: result.articles,
       });
     } catch (error) {
       console.error('[FTIP SmartRef /api/journals]', error);
       res.status(502).json({
         error:
-          'Gagal mengambil metadata artikel dari OpenAlex API. Periksa koneksi jaringan atau coba kata kunci lain.',
+          'Gagal mengambil metadata artikel dari OpenAlex maupun Crossref API. Periksa koneksi jaringan atau coba kata kunci lain.',
       });
     }
   });
@@ -599,5 +539,3 @@ startServer().catch((err) => {
   console.error('Gagal menjalankan server FTIP SmartRef:', err);
   process.exit(1);
 });
-return app;
-}
